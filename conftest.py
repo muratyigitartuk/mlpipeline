@@ -1,6 +1,15 @@
 import pytest
 import yaml
 import numpy as np
+import sys
+from pathlib import Path
+
+# Ensure the directory containing app.py is importable as 'app'
+here = Path(__file__).resolve().parent
+sys.path.append(str(here))
+mp = here / 'ml-pipeline'
+if mp.exists():
+    sys.path.append(str(mp))
 
 from app import create_app, AppConfig, ModelConfig, SecurityConfig
 
