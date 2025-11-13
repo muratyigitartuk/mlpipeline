@@ -24,6 +24,9 @@ config.yaml
 # Model files
 *.joblib
 
+# Runtime artifacts
+runtime/
+
 # Distribution / packaging
 build/
 dist/

@@ -7,7 +7,7 @@ License: MIT
 import logging
 import os
 import threading
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -34,6 +34,8 @@ if DEBUG:
 
 # Basic configuration settings
 CONFIG_PATH = Path(os.getenv('CONFIG_PATH', 'config.yaml'))
+OVERLAY_DIR = Path(os.getenv('CONFIG_OVERLAY_PATH', 'ml-pipeline/configs'))
+APP_ENV = os.getenv('APP_ENV')
 MODEL_RETRIES = int(os.getenv('MODEL_RETRIES', '3'))
 MODEL_RETRY_DELAY = int(os.getenv('MODEL_RETRY_DELAY', '5'))
 MAX_REQUEST_SIZE = int(os.getenv('MAX_REQUEST_SIZE', '1048576'))  # 1MB
@@ -84,6 +86,20 @@ METRICS = {
         'http_errors_total',
         'Total HTTP Errors',
         ['type']
+    ),
+    'model_latency': Histogram(
+        'request_duration_seconds_by_model',
+        'Request duration by model label',
+        ['model']
+    ),
+    'confidence_hist': Histogram(
+        'prediction_confidence',
+        'Prediction confidence histogram'
+    ),
+    'feature_mean': Summary(
+        'feature_mean_value',
+        'Mean value of features per request',
+        ['feature_index']
     )
 }
 
@@ -109,6 +125,7 @@ class AppConfig(BaseModel):
     enable_auth: bool = True
     ssl_cert: Optional[str] = None
     ssl_key: Optional[str] = None
+    registry: Optional[Dict[str, Union[str, bool]]] = None
 
     @classmethod
     def validate_ssl_files(cls, v: Optional[str]) -> Optional[str]:
@@ -125,6 +142,19 @@ def load_config() -> AppConfig:
     try:
         with open(CONFIG_PATH, 'r') as f:
             config_data = yaml.safe_load(f) or {}
+        if APP_ENV:
+            overlay_path = OVERLAY_DIR / f"{APP_ENV}.yaml"
+            if overlay_path.exists():
+                with open(overlay_path, 'r') as of:
+                    overlay = yaml.safe_load(of) or {}
+                def merge(a, b):
+                    for k, v in b.items():
+                        if isinstance(v, dict) and isinstance(a.get(k), dict):
+                            merge(a[k], v)
+                        else:
+                            a[k] = v
+                    return a
+                config_data = merge(config_data, overlay)
 
         # Ensure 'model' section exists
         if 'model_path' in config_data and 'model' not in config_data:
@@ -158,7 +188,10 @@ def load_config() -> AppConfig:
             "rate_limit": "RATE_LIMIT",
             "enable_auth": "ENABLE_AUTH",
             "ssl_cert": "SSL_CERT",
-            "ssl_key": "SSL_KEY"
+            "ssl_key": "SSL_KEY",
+            "registry.use_mlflow_registry": "USE_MLFLOW_REGISTRY",
+            "registry.stage": "REGISTRY_STAGE",
+            "registry.local_production_path": "LOCAL_PRODUCTION_PATH"
         }
 
         for config_path, env_var in env_mapping.items():
@@ -214,14 +247,35 @@ class MLPipeline:
             with METRICS['model_load_duration'].time():
                 with self._lock:
                     try:
-                        logger.info(f"Attempting to load model from: {config.model.model_path}")
-                        if not Path(config.model.model_path).exists():
-                            raise FileNotFoundError(f"Model file not found at: {config.model.model_path}")
-                        self.model = joblib.load(config.model.model_path)
+                        use_registry = bool(config.registry and config.registry.get('use_mlflow_registry', False))
+                        if use_registry:
+                            name = config.registry.get('model_name') or 'default'
+                            stage = config.registry.get('stage') or 'Production'
+                            try:
+                                import mlflow
+                                self.model = mlflow.pyfunc.load_model(f"models:/{name}/{stage}")
+                                self._verify_model()
+                                self._health_status = {"status": "ready", "last_loaded": datetime.now(timezone.utc).isoformat()}
+                                logger.info(f"Model loaded from MLflow registry: {name} {stage}")
+                                return
+                            except Exception as e:
+                                logger.warning(f"MLflow load failed: {str(e)}; falling back to local file")
+                        model_path = config.model.model_path
+                        local_path = config.registry.get('local_production_path') if config.registry else None
+                        if local_path:
+                            model_path = str(local_path)
+                        p = Path(model_path)
+                        if not p.exists():
+                            alt = Path('ml-pipeline') / p
+                            if alt.exists():
+                                p = alt
+                        if not p.exists():
+                            raise FileNotFoundError(f"Model file not found at: {model_path}")
+                        self.model = joblib.load(str(p))
                         self._verify_model()
                         self._health_status = {
                             "status": "ready",
-                            "last_loaded": datetime.now(UTC).isoformat()
+                            "last_loaded": datetime.now(timezone.utc).isoformat()
                         }
                         logger.info(f"Model loaded successfully from: {config.model.model_path}")
                         return
@@ -248,6 +302,13 @@ class MLPipeline:
             _ = self.model.predict(test_input)
         except Exception as validation_error:
             raise ModelValidationError(f"Model validation error: {str(validation_error)}")
+
+    def _load_model_by_registry(self, stage: str, name: str):
+        try:
+            import mlflow
+            return mlflow.pyfunc.load_model(f"models:/{name}/{stage}")
+        except Exception as e:
+            raise ModelLoadError(str(e))
 
     @lru_cache(maxsize=CACHE_SIZE)
     def _cached_predict(self, data_tuple: tuple) -> np.ndarray:
@@ -284,6 +345,18 @@ class MLPipeline:
                     logger.error(f"Prediction error: {str(prediction_error)}")
                     raise PredictionError(str(prediction_error))
 
+    def _predict_with_model(self, model, data: np.ndarray) -> np.ndarray:
+        if not hasattr(model, 'predict'):
+            raise PredictionError("Invalid model")
+        arr = np.array(data)
+        if arr.shape[1] != config.model.n_features:
+            raise PredictionError("Wrong number of features")
+        if np.any(np.isnan(arr)):
+            arr = np.nan_to_num(arr, nan=config.nan_replacement)
+        if np.any((arr < config.model.input_validation["min_value"]) | (arr > config.model.input_validation["max_value"])):
+            raise PredictionError("Input values out of valid range")
+        return model.predict(arr)
+
     def is_ready(self) -> bool:
         """Check if the model is ready for predictions"""
         return self.model is not None and hasattr(self.model, 'predict')
@@ -292,33 +365,30 @@ class MLPipeline:
         """Retrieve the health status of the model"""
         return self._health_status
 
-def create_app() -> Flask:
-    """Create and configure the Flask application with improved Swagger support"""
-    # Use a simpler app name to avoid potential shadowing issues
-    app = Flask(__name__)
+    def create_app() -> Flask:
+        """Create and configure the Flask application with improved Swagger support"""
+        app = Flask(__name__)
 
-    # Enhanced Swagger configuration for better compatibility
-    app.config['SWAGGER'] = {
+        app.config['SWAGGER'] = {
         'title': 'ArtukML API',
         'version': '3.0',
         'description': 'Production ML Pipeline API',
         'termsOfService': 'http://example.com/terms/',
         'contact': {'name': 'API Support', 'email': 'support@example.com'},
         'swagger_ui': True  # Ensure Swagger UI is enabled
-    }
-    Swagger(app)  # Initialize Swagger with the app
+        }
+        Swagger(app)
 
-    # Initialize the ML Pipeline
-    try:
-        pipeline = MLPipeline()
-    except ModelLoadError as load_error:
-        logger.critical(f"Application startup error: {str(load_error)}")
-        raise
+        try:
+            pipeline = MLPipeline()
+        except ModelLoadError as load_error:
+            logger.critical(f"Application startup error: {str(load_error)}")
+            raise
 
     # Add security headers to responses with relaxed CSP for Swagger UI
-    @app.after_request
-    def add_security_headers(response):
-        headers = {
+        @app.after_request
+        def add_security_headers(response):
+            headers = {
             'Content-Security-Policy': "default-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' 'unsafe-eval';",
             'X-Content-Type-Options': 'nosniff',
             'X-Frame-Options': 'DENY',
@@ -326,132 +396,128 @@ def create_app() -> Flask:
             'X-XSS-Protection': '1; mode=block',
             'Referrer-Policy': 'no-referrer'
         }
-        for key, value in headers.items():
-            response.headers[key] = value
-        return response
+            for key, value in headers.items():
+                response.headers[key] = value
+            return response
 
     # Configure rate limiter
-    limiter = Limiter(
-        app=app,
-        key_func=get_remote_address,
-        default_limits=[config.rate_limit]
-    )
+        limiter = Limiter(
+            app=app,
+            key_func=get_remote_address,
+            default_limits=[config.rate_limit]
+        )
 
     # JWT validation function
-    def verify_jwt(token: str) -> dict:
-        """Validate JWT token"""
-        try:
-            return jwt.decode(
-                token,
-                config.security.jwt_secret,
-                algorithms=[config.security.jwt_algorithm]
-            )
-        except Exception as auth_error:
-            logger.warning(f"Token validation error: {str(auth_error)}")
-            raise ValueError("Invalid token")
+        def verify_jwt(token: str) -> dict:
+            """Validate JWT token"""
+            try:
+                return jwt.decode(
+                    token,
+                    config.security.jwt_secret,
+                    algorithms=[config.security.jwt_algorithm]
+                )
+            except Exception as auth_error:
+                logger.warning(f"Token validation error: {str(auth_error)}")
+                raise ValueError("Invalid token")
 
     # Authentication decorator
-    def auth_required(roles: List[str] = None):
-        def decorator(f):
-            @wraps(f)
-            def wrapped(*args, **kwargs):
-                if not config.enable_auth:
-                    return f(*args, **kwargs)
+        def auth_required(roles: List[str] = None):
+            def decorator(f):
+                @wraps(f)
+                def wrapped(*args, **kwargs):
+                    if not config.enable_auth:
+                        return f(*args, **kwargs)
 
-                auth_header = request.headers.get('Authorization')
-                if not auth_header or not auth_header.startswith('Bearer '):
-                    return jsonify(error="Authorization token required"), 401
+                    auth_header = request.headers.get('Authorization')
+                    if not auth_header or not auth_header.startswith('Bearer '):
+                        return jsonify(error="Authorization token required"), 401
 
-                try:
-                    token = auth_header.split(' ')[1]
-                    claims = verify_jwt(token)
+                    try:
+                        token = auth_header.split(' ')[1]
+                        claims = verify_jwt(token)
 
-                    if roles and not any(role in claims.get('roles', []) for role in roles):
-                        return jsonify(error="Insufficient permissions"), 403
+                        if roles and not any(role in claims.get('roles', []) for role in roles):
+                            return jsonify(error="Insufficient permissions"), 403
 
-                    return f(*args, **kwargs)
-                except ValueError as validation_error:
-                    return jsonify(error=str(validation_error)), 401
-                except Exception as auth_error:
-                    logger.error(f"Authentication error: {str(auth_error)}")
-                    return jsonify(error="Authentication error"), 500
+                        return f(*args, **kwargs)
+                    except ValueError as validation_error:
+                        return jsonify(error=str(validation_error)), 401
+                    except Exception as auth_error:
+                        logger.error(f"Authentication error: {str(auth_error)}")
+                        return jsonify(error="Authentication error"), 500
 
-            return wrapped
-        return decorator
+                return wrapped
+            return decorator
 
     # Root endpoint (optional, for welcome message)
-    @app.route('/')
-    def index():
-        """Return a simple welcome message for the root URL"""
-        return jsonify({
+        @app.route('/')
+        def index():
+            """Return a simple welcome message for the root URL"""
+            return jsonify({
             "message": "Welcome to ArtukML Pipeline API! Use /api/v1/health or /api/v1/predict for endpoints.",
             "documentation": "http://127.0.0.1:5000/apidocs/"  # Swagger documentation URL
         })
 
     # Ignore favicon requests to avoid 404 in logs
-    @app.route('/favicon.ico')
-    def favicon():
-        """Ignore favicon requests to avoid 404 errors in logs"""
-        return '', 204  # No content, successful response
+        @app.route('/favicon.ico')
+        def favicon():
+            """Ignore favicon requests to avoid 404 errors in logs"""
+            return '', 204  # No content, successful response
 
     # Global error handler
-    @app.errorhandler(Exception)
-    def handle_error(error):
-        if isinstance(error, MLAPIException):
-            code = error.status_code
-            error_type = error.__class__.__name__
-        elif isinstance(error, HTTPException):
-            code = error.code
-            error_type = 'http_error'
-        else:
-            code = 500
-            error_type = 'internal_error'
-
-        message = str(error)
-        METRICS['errors_total'].labels(type=error_type).inc()
-
-        logger.error(f"Request error ({error_type}): {message}")
-        return jsonify(error=message, type=error_type), code
+        @app.errorhandler(Exception)
+        def handle_error(error):
+            if isinstance(error, MLAPIException):
+                code = error.status_code
+                error_type = error.__class__.__name__
+            elif isinstance(error, HTTPException):
+                code = error.code
+                error_type = 'http_error'
+            else:
+                code = 500
+                error_type = 'internal_error'
+            message = str(error)
+            METRICS['errors_total'].labels(type=error_type).inc()
+            logger.error(f"Request error ({error_type}): {message}")
+            try:
+                from pipeline.monitoring.alerts import send_slack_alert
+                send_slack_alert(f"ML API error [{error_type}]: {message}")
+            except Exception:
+                pass
+            return jsonify(error=message, type=error_type), code
 
     # Health check endpoint
-    @app.route('/api/v1/health')
-    @swag_from({
-        'responses': {
-            200: {
-                'description': 'System health status'
-            }
-        }
-    })
-    def health():
-        """Return the health status of the system"""
-        return jsonify({
-            'status': 'healthy',
-            'timestamp': datetime.now(UTC).isoformat(),
-            'model': pipeline.get_health_status()
-        })
+        @app.route('/api/v1/health')
+        @swag_from({'responses': {200: {'description': 'System health status'}}})
+        def health():
+            """Return the health status of the system"""
+            return jsonify({
+                'status': 'healthy',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'model': pipeline.get_health_status()
+            })
 
     # Metrics endpoint
-    @app.route('/api/v1/metrics')
-    def metrics():
-        """Return Prometheus metrics"""
-        from prometheus_client import generate_latest
-        return generate_latest()
+        @app.route('/api/v1/metrics')
+        def metrics():
+            """Return Prometheus metrics"""
+            from prometheus_client import generate_latest
+            return generate_latest()
 
     # Prediction request model
-    class PredictionRequest(BaseModel):
-        """Schema for prediction request data"""
-        data: List[List[float]]
-
-        @classmethod
-        def validate_data(cls, value: List[List[float]]) -> List[List[float]]:
-            """Validate prediction request data"""
-            if not value:
-                raise ValueError("Empty data sent")
-            return value
+        class PredictionRequest(BaseModel):
+            """Schema for prediction request data"""
+            data: List[List[float]]
+            @classmethod
+            def validate_data(cls, value: List[List[float]]) -> List[List[float]]:
+                """Validate prediction request data"""
+                if not value:
+                    raise ValueError("Empty data sent")
+                return value
 
     # Prediction endpoint
-    @app.route('/api/v1/predict', methods=['POST'])
-    @swag_from({
+        @app.route('/api/v1/predict', methods=['POST'])
+        @swag_from({
         'parameters': [{
             'name': 'body',
             'in': 'body',
@@ -464,29 +530,146 @@ def create_app() -> Flask:
             }
         }
     })
-    @auth_required(roles=config.allowed_roles)
-    @limiter.limit(config.rate_limit)
-    def predict():
-        """Handle prediction requests"""
+        @auth_required(roles=config.allowed_roles)
+        @limiter.limit(config.rate_limit)
+        def predict():
+            """Handle prediction requests"""
+            with METRICS['request_duration'].labels('predict').time():
+                try:
+                    if not request.is_json:
+                        raise ValueError("JSON data required")
+                    data = request.get_json()
+                    if not data:
+                        raise ValueError("Empty request sent")
+                    validated_data = PredictionRequest(**data)
+                    dynamic_stage = None
+                    dynamic_model = None
+                    tenant = request.headers.get('X-Tenant')
+                    if config.registry:
+                        if config.registry.get('allow_dynamic_stage'):
+                            dynamic_stage = request.headers.get('X-Model-Stage')
+                        if config.registry.get('allow_dynamic_model'):
+                            dynamic_model = request.headers.get('X-Model-Name')
+                        if tenant and isinstance(config.registry.get('tenant_models'), dict):
+                            tm = config.registry.get('tenant_models')
+                            tconf = tm.get(tenant)
+                            if isinstance(tconf, dict):
+                                dynamic_model = tconf.get('model_name') or dynamic_model
+                                dynamic_stage = tconf.get('stage') or dynamic_stage
+                    model_label = 'local'
+                    if config.registry and config.registry.get('use_mlflow_registry'):
+                        model_label = f"mlflow:{config.registry.get('stage','Production')}"
+                    if dynamic_stage and dynamic_model:
+                        model_label = f"{dynamic_model}:{dynamic_stage}"
+                    confidences = None
+                    with METRICS['model_latency'].labels(model_label).time():
+                        if dynamic_stage and dynamic_model and config.registry.get('use_mlflow_registry'):
+                            model = pipeline._load_model_by_registry(dynamic_stage, dynamic_model)
+                            arr = np.array(validated_data.data)
+                            predictions = pipeline._predict_with_model(model, arr)
+                            if hasattr(model, 'predict_proba'):
+                                try:
+                                    probs = model.predict_proba(arr)
+                                    confidences = probs.max(axis=1).tolist()
+                                except Exception:
+                                    confidences = None
+                        else:
+                            arr = np.array(validated_data.data)
+                            predictions = pipeline.predict(arr)
+                            if hasattr(pipeline.model, 'predict_proba'):
+                                try:
+                                    probs = pipeline.model.predict_proba(arr)
+                                    confidences = probs.max(axis=1).tolist()
+                                except Exception:
+                                    confidences = None
+                    if confidences:
+                        for c in confidences:
+                            METRICS['confidence_hist'].observe(c)
+                    arr = np.array(validated_data.data)
+                    if arr.ndim == 2 and arr.shape[1] == config.model.n_features:
+                        means = arr.mean(axis=0)
+                        for idx, val in enumerate(means):
+                            METRICS['feature_mean'].labels(str(idx)).observe(float(val))
+                    resp = {'predictions': predictions.tolist(), 'timestamp': datetime.now(timezone.utc).isoformat()}
+                    if confidences:
+                        resp['confidence'] = confidences
+                    return jsonify(resp)
+                except ValidationError as validation_error:
+                    raise ModelValidationError(str(validation_error))
+
+        return app
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    app.config['SWAGGER'] = {
+        'title': 'ArtukML API',
+        'version': '3.0',
+        'description': 'Production ML Pipeline API',
+        'termsOfService': 'http://example.com/terms/',
+        'contact': {'name': 'API Support', 'email': 'support@example.com'},
+        'swagger_ui': True
+    }
+    Swagger(app)
+    pipeline_local = MLPipeline()
+    @app.after_request
+    def add_security_headers(response):
+        headers = {
+            'Content-Security-Policy': "default-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' 'unsafe-eval';",
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+            'X-XSS-Protection': '1; mode=block',
+            'Referrer-Policy': 'no-referrer'
+        }
+        for k, v in headers.items():
+            response.headers[k] = v
+        return response
+    limiter_local = Limiter(app=app, key_func=get_remote_address, default_limits=[config.rate_limit])
+    def verify_jwt_local(token: str) -> dict:
+        try:
+            return jwt.decode(token, config.security.jwt_secret, algorithms=[config.security.jwt_algorithm])
+        except Exception:
+            raise ValueError('Invalid token')
+    def auth_required_local(roles: List[str] = None):
+        def decorator(f):
+            @wraps(f)
+            def wrapped(*args, **kwargs):
+                if not config.enable_auth:
+                    return f(*args, **kwargs)
+                auth_header = request.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    return jsonify(error='Authorization token required'), 401
+                try:
+                    token = auth_header.split(' ')[1]
+                    claims = verify_jwt_local(token)
+                    if roles and not any(role in claims.get('roles', []) for role in roles):
+                        return jsonify(error='Insufficient permissions'), 403
+                    return f(*args, **kwargs)
+                except ValueError as ve:
+                    return jsonify(error=str(ve)), 401
+                except Exception:
+                    return jsonify(error='Authentication error'), 500
+            return wrapped
+        return decorator
+    @app.route('/')
+    def index():
+        return jsonify({'message': 'Welcome to ArtukML Pipeline API! Use /api/v1/health or /api/v1/predict for endpoints.', 'documentation': 'http://127.0.0.1:5000/apidocs/'})
+    @app.route('/api/v1/health')
+    def health_local():
+        return jsonify({'status': 'healthy', 'timestamp': datetime.now(timezone.utc).isoformat(), 'model': pipeline_local.get_health_status()})
+    @app.route('/api/v1/predict', methods=['POST'])
+    @auth_required_local(roles=config.allowed_roles)
+    @limiter_local.limit(config.rate_limit)
+    def predict_local():
         with METRICS['request_duration'].labels('predict').time():
-            try:
-                if not request.is_json:
-                    raise ValueError("JSON data required")
-
-                data = request.get_json()
-                if not data:
-                    raise ValueError("Empty request sent")
-
-                validated_data = PredictionRequest(**data)
-                predictions = pipeline.predict(np.array(validated_data.data))
-
-                return jsonify({
-                    'predictions': predictions.tolist(),
-                    'timestamp': datetime.now(UTC).isoformat()
-                })
-            except ValidationError as validation_error:
-                raise ModelValidationError(str(validation_error))
-
+            if not request.is_json:
+                return jsonify(error='JSON data required'), 400
+            data = request.get_json()
+            if not data:
+                return jsonify(error='Empty request sent'), 400
+            arr = np.array(data.get('data'))
+            predictions = pipeline_local.predict(arr)
+            return jsonify({'predictions': predictions.tolist(), 'timestamp': datetime.now(timezone.utc).isoformat()})
     return app
 
 if __name__ == '__main__':

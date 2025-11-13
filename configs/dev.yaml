@@ -1,0 +1,11 @@
+rate_limit: "100/minute"
+enable_auth: true
+registry:
+  use_mlflow_registry: false
+  local_production_path: "model/production/model.joblib"
+streaming:
+  kafka:
+    bootstrap_servers: "localhost:9092"
+    input_topic: "inference_requests"
+    output_topic: "inference_responses"
+    group_id: "mlpipeline-dev"

@@ -1,0 +1,12 @@
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r ml-pipeline/requirements.txt
+      - run: pytest -q ml-pipeline/tests/unit/test_ingestion_validation.py ml-pipeline/tests/integration/test_canary_shadow.py

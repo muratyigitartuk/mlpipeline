@@ -1,0 +1,12 @@
+rate_limit: "200/minute"
+enable_auth: true
+registry:
+  use_mlflow_registry: true
+  stage: "Staging"
+  model_name: "mlp_default"
+streaming:
+  kafka:
+    bootstrap_servers: "staging-broker:9092"
+    input_topic: "inference_requests"
+    output_topic: "inference_responses"
+    group_id: "mlpipeline-staging"

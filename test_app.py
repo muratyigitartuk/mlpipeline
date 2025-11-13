@@ -1,7 +1,7 @@
 import pytest
 from app import create_app
 import jwt
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 
 @pytest.fixture
 def app():
@@ -19,8 +19,8 @@ def generate_valid_token():
     algorithm = "HS256"
     payload = {
         "roles": ["admin"],  # Must match allowed_roles in config.yaml
-        "exp": datetime.now(UTC) + timedelta(minutes=60),  # 60 minutes valid
-        "iat": datetime.now(UTC),  # Issuance time
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=60),  # 60 minutes valid
+        "iat": datetime.now(timezone.utc),  # Issuance time
         "sub": "test-user"
     }
     return jwt.encode(payload, secret_key, algorithm=algorithm)

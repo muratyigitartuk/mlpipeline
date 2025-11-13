@@ -1,0 +1,25 @@
+{
+  "title": "ML Pipeline Overview",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "HTTP Request Duration",
+      "targets": [{"expr": "histogram_quantile(0.5, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"}]
+    },
+    {
+      "type": "graph",
+      "title": "Latency by Model",
+      "targets": [{"expr": "histogram_quantile(0.5, sum(rate(request_duration_seconds_by_model_bucket[5m])) by (le, model))"}]
+    },
+    {
+      "type": "graph",
+      "title": "Confidence Histogram",
+      "targets": [{"expr": "sum(rate(prediction_confidence_bucket[5m])) by (le)"}]
+    },
+    {
+      "type": "graph",
+      "title": "Errors",
+      "targets": [{"expr": "sum(rate(http_errors_total[5m])) by (type)"}]
+    }
+  ]
+}

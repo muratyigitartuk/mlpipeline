@@ -2,6 +2,17 @@
 
 A production-ready Machine Learning Pipeline API built with Flask, designed for secure, scalable, and efficient model serving in enterprise-grade applications.
 
+## 🚀 Showcase
+
+- End-to-end runnable pipeline components for demonstration:
+  - Synthetic batch ingestion to partitioned Parquet and Pydantic validation
+  - Offline feature aggregation and simple SQLite-based online materialization
+  - Training and local promotion to `model/production/model.joblib`
+  - Batch scoring on Parquet features and streaming scoring (JSONL and Kafka)
+  - Extended Prometheus metrics: latency by model, prediction confidence histogram, feature mean summaries
+  - Config overlays for `dev/staging/prod` via `APP_ENV`
+  - Unit, integration, and e2e tests with CI workflow
+
 ## 🌟 Features
 
 - **Secure Model Serving**: JWT-based authentication with role-based access control for enhanced security.
@@ -16,6 +27,9 @@ A production-ready Machine Learning Pipeline API built with Flask, designed for 
 - **Health Monitoring**: Built-in health check endpoint for system status verification.
 - **Input Validation**: Pydantic-based request validation for robust data handling.
 - **NaN Handling**: Configurable handling of missing values (NaN) in prediction inputs.
+- **Feature Pipeline**: Offline feature aggregation and online materialization to SQLite.
+- **Batch/Streaming Scoring**: Batch jobs over Parquet inputs and streaming consumer (JSONL/Kafka).
+- **Config Overlays**: Environment overlays (`dev/staging/prod`) merged with base config.
 
 ## 🚀 Quick Start
 
@@ -57,6 +71,9 @@ A production-ready Machine Learning Pipeline API built with Flask, designed for 
 
 #### Using Python
 ```bash
+  # Set config path and environment overlay as needed
+  set CONFIG_PATH=ml-pipeline\config.yaml
+  set APP_ENV=dev
   python app.py
 ```
 
@@ -108,10 +125,10 @@ The API uses JWT tokens for authentication (required for /api/v1/predict). Inclu
   -d '{"data": [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]]}'
 ```
 
-To generate a JWT token, use the JWT/generate_token.py script or a similar tool, ensuring the JWT_SECRET matches your config.yaml or environment variable settings (e.g., stored in GitHub Secrets). Example usage:
+To generate a JWT token, use the `ml-pipeline/generate_token.py` script or a similar tool, ensuring the JWT_SECRET matches your config.yaml or environment variable settings (e.g., stored in GitHub Secrets). Example usage:
 
 ```bash
-  python JWT/generate_token.py  # Generates a token with default settings
+  python ml-pipeline/generate_token.py  # Generates a token with default settings
 ```
 
 Example token generation code (modify as needed):
@@ -190,6 +207,9 @@ To verify the /api/v1/predict endpoint, follow these steps:
 - **CACHE_SIZE**: Size of the LRU cache for predictions (default: 1024).
 - **JWT_SECRET**: Secret key for JWT token generation and validation (store securely in GitHub Secrets for production).
 - **PORT**: Application port (default: 5000).
+- **CONFIG_PATH**: Override config file path (e.g., `ml-pipeline/config.yaml`).
+- **APP_ENV**: Environment overlay selector (`dev`, `staging`, `prod`).
+- **SLACK_WEBHOOK**: Optional webhook for error alerts.
 
 ### Config File (config.yaml)
 
@@ -219,12 +239,34 @@ ssl_key: null                     # Path to SSL key (optional)
 
 Note: Never use "default-secret" or "your-secret-key" in production. Use a secure, randomly generated secret stored in environment variables or GitHub Secrets.
 
+### Config Overlays
+
+- Overlays live at `ml-pipeline/configs/` and are merged into base `config.yaml` when `APP_ENV` is set.
+- Examples:
+  - `ml-pipeline/configs/dev.yaml`
+  - `ml-pipeline/configs/staging.yaml`
+  - `ml-pipeline/configs/prod.yaml`
+
+### Streaming (Kafka)
+
+- Configure `streaming.kafka` in `config.yaml` or overlays:
+  - `bootstrap_servers`, `input_topic`, `output_topic`, `group_id`.
+  - Use `ml-pipeline/scripts/run_kafka_consumer.py` to consume, score, and publish predictions.
+
 ## 🔍 Testing
 
 Run the test suite locally:
 
 ```bash
-  pytest test/
+  # Local full suite
+  set CONFIG_PATH=ml-pipeline\config.yaml
+  set APP_ENV=dev
+  pytest -q
+
+Included tests:
+ - Unit: ingestion and validation
+ - Integration: canary/shadow side-by-side predictions
+ - E2E: predict endpoint with trained model and JWT
 ```
 
 Ensure all tests pass, covering health checks, predictions, authentication, error cases, and rate limiting. In the GitHub Actions pipeline, test results are stored in test-results.xml for detailed reporting. Access test reports in GitHub Actions logs under the "Artifacts" section.
@@ -238,6 +280,9 @@ The application exposes Prometheus metrics at /api/v1/metrics. Available metrics
 - **prediction_duration_seconds**: Summary of model prediction duration in seconds.
 - **model_load_duration_seconds**: Summary of model loading duration in seconds.
 - **http_errors_total**: Total HTTP errors, categorized by error type.
+- **request_duration_seconds_by_model**: Latency by selected model/stage.
+- **prediction_confidence**: Histogram of prediction confidences.
+- **feature_mean_value**: Mean value per feature index per request.
 
 To monitor effectively, configure a Prometheus server to scrape /api/v1/metrics and visualize data with Grafana. Example Prometheus configuration:
 
@@ -249,6 +294,38 @@ scrape_configs:
 ```
 
 Create a Grafana dashboard to visualize metrics like request latency, prediction duration, and error rates for optimal monitoring.
+
+### Drift Report (Evidently)
+
+- Run `python ml-pipeline/scripts/run_drift_report.py` to generate `ml-pipeline/runtime/reports/drift.html`.
+
+## 🧩 Pipeline Scripts (Demo)
+
+- Ingestion + Validation:
+  - `python ml-pipeline/scripts/run_ingestion_validation.py`
+  - Generates raw partitioned Parquet and splits valid/invalid records.
+- Feature Materialization:
+  - `python ml-pipeline/scripts/run_feature_materialization.py`
+  - Aggregates offline features and writes to SQLite online store.
+- Training & Promotion:
+  - `python ml-pipeline/scripts/run_training.py`
+  - `python ml-pipeline/scripts/promote_model.py` → copies to `model/production/model.joblib`.
+- Batch Scoring:
+  - `python ml-pipeline/scripts/generate_synthetic_features.py`
+  - `python ml-pipeline/scripts/run_batch_scoring.py`
+- Streaming Scoring (JSONL):
+  - Prepare `ml-pipeline/runtime/stream/input.jsonl` lines like `{ "features": [0.1, ...] }`
+  - `python ml-pipeline/scripts/run_stream_consumer.py`
+- Kafka Streaming Scoring:
+  - Configure `streaming.kafka` and run `python ml-pipeline/scripts/run_kafka_consumer.py`.
+
+## ✅ CI
+
+- Minimal GitHub Actions workflow at `ml-pipeline/.github/workflows/ci.yml` runs unit and integration tests on push.
+
+## 🎯 Portfolio Pitch
+
+- This repo demonstrates a production-style ML serving pipeline: secure API, data/feature pipeline, training/promotion, batch/stream scoring, metrics, overlays, and tests. It’s fully runnable for showcasing engineering and MLOps skills, with clear paths to integrate Feast, MLflow registry service, and orchestration tools when desired.
 
 ## 🔒 Security Features
 
