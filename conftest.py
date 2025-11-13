@@ -1,17 +1,15 @@
+import os
+import sys
+from pathlib import Path
 import pytest
 import yaml
 import numpy as np
-import sys
-from pathlib import Path
 
-# Ensure the directory containing app.py is importable as 'app'
-here = Path(__file__).resolve().parent
-sys.path.append(str(here))
-mp = here / 'ml-pipeline'
-if mp.exists():
-    sys.path.append(str(mp))
-
-from app import create_app, AppConfig, ModelConfig, SecurityConfig
+# Ensure imports work on CI and set config path before importing app
+HERE = Path(__file__).resolve().parent
+sys.path.append(str(HERE))
+os.environ.setdefault('CONFIG_PATH', str(HERE / 'config.yaml'))
+os.environ.setdefault('APP_ENV', 'dev')
 
 @pytest.fixture
 def temp_config_file(tmp_path):
@@ -48,7 +46,7 @@ def mock_model():
 @pytest.fixture
 def mock_pipeline(mock_model):
     """Mock MLPipeline for testing"""
-    from app import MLPipeline
+    from app import MLPipeline, AppConfig, ModelConfig, SecurityConfig
     pipeline = MLPipeline()
     pipeline.model = mock_model
     pipeline._health_status = {'status': 'ready'}
@@ -68,6 +66,7 @@ def mock_pipeline(mock_model):
 @pytest.fixture
 def client():
     """Flask test client"""
+    from app import create_app
     app = create_app()
     app.config['TESTING'] = True
     with app.test_client() as client:
